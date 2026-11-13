@@ -1,6 +1,6 @@
 # Relate Lab dev container.
 # One container, no services. Everything the lessons need is a command line tool.
-FROM mcr.microsoft.com/devcontainers/base:3.0.12-ubuntu-24.04
+FROM mcr.microsoft.com/devcontainers/base:2.0.5-ubuntu-24.04
 
 # The non-root user the base image ships with. Students work as this user.
 ARG USERNAME=vscode

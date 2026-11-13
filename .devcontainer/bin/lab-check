@@ -1,0 +1,357 @@
+#!/usr/bin/env bash
+# lab-check: confirm the Relate lab works.
+#
+#   lab-check          check the tools and the lab folder (about a second)
+#   lab-check --full   also replay every lesson and challenge in a scratch folder
+#
+# The full check uses the relate on your PATH, so it tests what you would run.
+# It works in a temporary folder and never touches your lab files.
+# Exit code 0 means every check passed.
+set -uo pipefail
+
+# Checks must not send usage metrics or use up the one-time telemetry notice.
+export RELATE_TELEMETRY=0
+
+full=0
+for arg in "$@"; do
+  case "${arg}" in
+    --full) full=1 ;;
+    -h | --help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "lab-check: unknown option: ${arg}" >&2; exit 2 ;;
+  esac
+done
+
+passed=0
+failed=0
+
+pass() {
+  passed=$((passed + 1))
+  printf '  ok    %s\n' "$1"
+}
+
+fail() {
+  failed=$((failed + 1))
+  printf '  FAIL  %s\n' "$1"
+  if [ -n "${2:-}" ]; then
+    printf '%s\n' "$2" | sed 's/^/          /'
+  fi
+}
+
+# expect_eq NAME EXPECTED ACTUAL
+expect_eq() {
+  if [ "$2" = "$3" ]; then
+    pass "$1"
+  else
+    fail "$1" "expected: $2
+actual:   $3"
+  fi
+}
+
+# expect_has NAME NEEDLE HAYSTACK
+expect_has() {
+  case "$3" in
+    *"$2"*) pass "$1" ;;
+    *) fail "$1" "expected to find: $2
+in output: $3" ;;
+  esac
+}
+
+section() {
+  printf '\n%s\n' "$1"
+}
+
+# ---------------------------------------------------------------- quick check
+
+section "Tools"
+
+for tool in relate duckdb curl ssh-keygen sha256sum; do
+  if command -v "${tool}" >/dev/null 2>&1; then
+    pass "${tool} is on PATH ($(command -v "${tool}"))"
+  else
+    fail "${tool} is on PATH" "not found. Rebuild the container: Command Palette > Codespaces: Rebuild Container"
+  fi
+done
+
+if ! command -v relate >/dev/null 2>&1; then
+  printf '\nrelate is missing, so nothing else can be checked.\n'
+  exit 1
+fi
+
+relate_version="$(relate --version 2>/dev/null | head -n 1)"
+expect_has "relate --version prints a version" "Relate v" "${relate_version}"
+
+pinned=""
+versions_file="${LAB_PREFIX:-/usr/local}/share/relate-lab/versions"
+if [ -r "${versions_file}" ]; then
+  pinned="$(sed -n 's/^RELATE_VERSION=//p' "${versions_file}")"
+fi
+if [ -n "${pinned}" ] && [ "${relate_version}" != "Relate ${pinned}" ]; then
+  printf '  note  you are running %s. This lab was tested with %s.\n' "${relate_version}" "${pinned}"
+  printf '        That is fine. To go back, run: lab-reset --tools\n'
+fi
+
+local_bin_check="\$HOME/.local/bin is on PATH"
+case ":${PATH}:" in
+  *":${HOME}/.local/bin:"*) pass "${local_bin_check}" ;;
+  *) fail "${local_bin_check}" "run: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
+esac
+
+expect_eq "relate runs a query in memory" "ok
+1" "$(relate --mode csv "RETURN 1 AS ok" 2>&1)"
+
+section "Lab folder"
+
+LAB_DIR="${LAB_DIR:-}"
+if [ -n "${LAB_DIR}" ] && [ -d "${LAB_DIR}" ] && [ -w "${LAB_DIR}" ]; then
+  pass "lab folder exists and is writable (${LAB_DIR})"
+else
+  fail "lab folder exists and is writable" "LAB_DIR='${LAB_DIR}'. Run: lab-reset --init"
+fi
+if [ -n "${LAB_DIR}" ] && [ -f "${LAB_DIR}/data/people.parquet" ]; then
+  pass "Parquet sample file is in place (data/people.parquet)"
+else
+  printf '  note  data/people.parquet is missing. Only the optional Parquet step needs it.\n'
+  printf '        To restore it, run: lab-reset --init\n'
+fi
+
+if [ "${full}" -ne 1 ]; then
+  printf '\n%d passed, %d failed\n' "${passed}" "${failed}"
+  if [ "${failed}" -eq 0 ]; then
+    printf 'The lab is ready. For an end-to-end test of every lesson, run: lab-check --full\n'
+  fi
+  [ "${failed}" -eq 0 ]
+  exit $?
+fi
+
+# ----------------------------------------------------------------- full check
+
+work="$(mktemp -d)"
+trap 'rm -rf "${work}"' EXIT
+cd "${work}" || exit 1
+
+section "Lesson 1: Install Relate"
+
+out="$(relate query --mode csv 2>&1 <<'EOF'
+CREATE (:Person {name: 'Oskar'})
+  -[:WORKS_ON {since: 2024}]->(:Project {name: 'relate'});
+MATCH (p:Person)-[w:WORKS_ON]->(proj:Project)
+RETURN p.name AS person, proj.name AS project, w.since AS since;
+MATCH (:Person)-[w:WORKS_ON]->(:Project)
+RETURN valueType(w.since) AS type;
+RETURN valueType('relate') AS type;
+EOF
+)"
+# In csv mode a statement that returns no rows prints an empty line. Drop those.
+out="$(printf '%s\n' "${out}" | sed '/^$/d')"
+expect_eq "shell statements create and read the graph" "person,project,since
+Oskar,relate,2024
+type
+INTEGER NOT NULL
+type
+STRING NOT NULL" "${out}"
+
+relate query --database ./demo.rl \
+  "CREATE (:Person {name: 'Oskar'})
+     -[:WORKS_ON {since: 2024}]->(:Project {name: 'relate'})" >/dev/null 2>&1
+expect_eq "a write creates demo.rl" "yes" "$([ -e ./demo.rl ] && echo yes || echo no)"
+
+out="$(relate --database ./demo.rl --read-only --mode table \
+  "MATCH (p:Person)-[w:WORKS_ON]->(proj:Project)
+   RETURN p.name AS person, proj.name AS project, w.since AS since" 2>&1)"
+expect_has "a read-only open prints the table" '| "Oskar" | "relate" | 2024  |' "${out}"
+
+out="$(relate --database ./demo.rl --read-only --mode table "CREATE (:Person {name: 'Nope'})" 2>&1)"
+code=$?
+expect_eq "a write through --read-only exits non-zero" "6" "${code}"
+expect_has "the refusal names WriteOnReadOnlyAccessDatabase" "WriteOnReadOnlyAccessDatabase" "${out}"
+
+read_query="MATCH (p:Person)-[w:WORKS_ON]->(proj:Project) RETURN p.name AS person, proj.name AS project, w.since AS since"
+expect_eq "--mode csv" "person,project,since
+Oskar,relate,2024" "$(relate --database ./demo.rl --read-only --mode csv "${read_query}" 2>&1)"
+expect_has "--mode json puts rows under data" '{"data":[{"person":"Oskar","project":"relate","since":2024}]' \
+  "$(relate --database ./demo.rl --read-only --mode json "${read_query}" 2>&1)"
+expect_eq "--mode jsonl" '{"person":"Oskar","project":"relate","since":2024}' \
+  "$(relate --database ./demo.rl --read-only --mode jsonl "${read_query}" 2>&1)"
+expect_has "--mode markdown" '| "Oskar" | "relate" | 2024  |' \
+  "$(relate --database ./demo.rl --read-only --mode markdown "${read_query}" 2>&1)"
+expect_has "--mode toon" 'rows[1]{person,project,since}:' \
+  "$(relate --database ./demo.rl --read-only --mode toon "${read_query}" 2>&1)"
+expect_eq "piped output defaults to jsonl" '{"person":"Oskar","project":"relate","since":2024}' \
+  "$(RELATE_AGENT_MODE=0 relate --database ./demo.rl --read-only "${read_query}" 2>/dev/null | cat)"
+expect_eq "--csv is shorthand for --mode csv" "person,project,since
+Oskar,relate,2024" "$(relate --database ./demo.rl --read-only --csv "${read_query}" 2>&1)"
+rm -rf ./demo.rl
+
+section "Challenge 2: Run Your First Query"
+
+out="$(relate query --mode csv 2>&1 <<'EOF'
+CREATE (:Person {name: 'Oskar'});
+CREATE (:Project {name: 'relate'});
+MATCH (p:Person {name: 'Oskar'}), (j:Project {name: 'relate'})
+CREATE (p)-[:WORKS_ON {since: 2024}]->(j);
+MATCH (p:Person)-[w:WORKS_ON]->(:Project)
+RETURN valueType(p.name) AS nameType,
+  valueType(w.since) AS sinceType;
+EOF
+)"
+out="$(printf '%s\n' "${out}" | sed '/^$/d')"
+expect_eq "a name is a string and a bare year is an integer" "nameType,sinceType
+STRING NOT NULL,INTEGER NOT NULL" "${out}"
+
+section "Lesson 3: Seed Data From Different Sources"
+
+cat > people.cypher <<'EOF'
+MERGE (o:Person {name: 'Oskar'}) SET o.role = 'engineer';
+MERGE (m:Person {name: 'Michael'}) SET m.role = 'engineer';
+MERGE (w:Person {name: 'Will'}) SET w.role = 'maintainer';
+EOF
+relate query --database ./team.rl < people.cypher >/dev/null 2>&1
+expect_eq "people.cypher loads three people" "people
+3" "$(relate --database ./team.rl --read-only --mode csv "MATCH (p:Person) RETURN count(p) AS people" 2>&1)"
+
+relate query --database ./team.rl < people.cypher >/dev/null 2>&1
+expect_eq "running the MERGE script twice still gives three people" "people
+3" "$(relate --database ./team.rl --read-only --mode csv "MATCH (p:Person) RETURN count(p) AS people" 2>&1)"
+
+out="$(relate --database ./team.rl < people.cypher 2>&1 | head -n 1)"
+expect_has "without the word query, relate prints its help" "Usage: relate" "${out}"
+
+mkdir -p import
+cat > import/works_on.csv <<'EOF'
+person,project,since
+Oskar,relate,2024
+Michael,relate,2023
+Will,relate,2021
+EOF
+cat > load.cypher <<'EOF'
+LOAD CSV WITH HEADERS FROM 'file:///works_on.csv' AS row
+MATCH (p:Person {name: row.person})
+MERGE (proj:Project {name: row.project})
+MERGE (p)-[w:WORKS_ON]->(proj)
+SET w.since = toInteger(row.since);
+EOF
+
+out="$(relate query --database ./team.rl < load.cypher 2>&1)"
+expect_has "LOAD CSV is refused without --load-csv-dir" "LOAD CSV file unavailable" "${out}"
+
+relate query --database ./team.rl --load-csv-dir ./import < load.cypher >/dev/null 2>&1
+expect_eq "LOAD CSV with --load-csv-dir exits 0" "0" "$?"
+expect_eq "the CSV made three relationships with integer years" "person,since,type
+Will,2021,INTEGER NOT NULL
+Michael,2023,INTEGER NOT NULL
+Oskar,2024,INTEGER NOT NULL" "$(relate --database ./team.rl --read-only --mode csv \
+  "MATCH (p:Person)-[w:WORKS_ON]->(:Project)
+   RETURN p.name AS person, w.since AS since, valueType(w.since) AS type ORDER BY since" 2>&1)"
+
+mkdir -p data
+duckdb -c "COPY (SELECT * FROM (VALUES ('Oskar', 'engineer'), ('Michael', 'engineer'), ('Will', 'maintainer')) AS people(name, role))
+  TO 'data/people.parquet' (FORMAT PARQUET)" >/dev/null 2>&1
+duckdb -c "COPY (SELECT * FROM 'data/people.parquet')
+  TO 'import/people.csv' (HEADER, DELIMITER ',')" >/dev/null 2>&1
+expect_eq "DuckDB converts Parquet to CSV" "name,role
+Oskar,engineer
+Michael,engineer
+Will,maintainer" "$(cat import/people.csv 2>&1)"
+
+section "Lesson 4: Write and Read Data"
+
+relate --database ./team.rl --mode table \
+  "MERGE (p:Person {name: 'Andreas'}) SET p.role = 'designer'" >/dev/null 2>&1
+expect_eq "a write from the command line exits 0" "0" "$?"
+expect_eq "the read shows four people" "person,role
+Oskar,engineer
+Michael,engineer
+Will,maintainer
+Andreas,designer" "$(relate --database ./team.rl --read-only --mode csv \
+  "MATCH (p:Person) RETURN p.name AS person, p.role AS role" 2>&1)"
+# The $name below is a Cypher parameter, not a shell variable.
+# shellcheck disable=SC2016
+expect_eq "--param binds a value" "role
+maintainer" "$(relate --database ./team.rl --read-only --mode csv --param name=Will \
+  'MATCH (p:Person {name: $name}) RETURN p.role AS role' 2>&1)"
+
+# shellcheck disable=SC2016
+out="$(relate --database ./team.rl --read-only --mode table \
+  'MATCH (p:Person {name: $name}) RETURN p.role AS role' 2>&1)"
+expect_has "a missing parameter reports ParameterMissing" "ParameterMissing: Expected parameter(s): name" "${out}"
+
+relate --database ./missing.rl --read-only "RETURN 1" >/dev/null 2>&1
+expect_eq "a read-only open never creates a database" "no" "$([ -e ./missing.rl ] && echo yes || echo no)"
+
+section "Challenge 5: Load a Graph From Two Sources"
+
+rm -rf ./team.rl ./import ./load.cypher
+mkdir -p import
+cat > import/contributions.csv <<'EOF'
+contributor,repo,year,language
+Oskar,relate,2024,Rust
+Michael,relate,2023,Rust
+Michael,relate,2023,Rust
+Will,relate,2021,Rust
+Michael,opencypher-tck,2022,Gherkin
+Michaell,relate,2020,Rust
+EOF
+relate query --database ./team.rl < people.cypher >/dev/null 2>&1
+cat > load.cypher <<'EOF'
+LOAD CSV WITH HEADERS FROM 'file:///contributions.csv' AS row
+MATCH (p:Person {name: row.contributor})
+MERGE (proj:Project {name: row.repo})
+SET proj.language = row.language
+MERGE (p)-[w:WORKS_ON]->(proj)
+SET w.since = toInteger(row.year);
+EOF
+relate query --database ./team.rl \
+  --load-csv-dir ./import < load.cypher >/dev/null 2>&1
+expect_eq "the solution script loads" "0" "$?"
+expect_eq "the duplicate row merges and the misspelt row is skipped" "relationships
+4" "$(relate --database ./team.rl --read-only --mode csv \
+  "MATCH ()-[w:WORKS_ON]->() RETURN count(w) AS relationships" 2>&1)"
+expect_eq "three people work on relate" "people
+3" "$(relate --database ./team.rl --read-only --mode csv \
+  "MATCH (p:Person)-[:WORKS_ON]->(:Project {name: 'relate'})
+   RETURN count(p) AS people" 2>&1)"
+
+section "Lesson 6: Write and Read With an Agent"
+
+# A throwaway HOME keeps this test out of the student's real agent folders.
+out="$(HOME="${work}/home" relate skill install --agent claude-code 2>&1)"
+expect_eq "relate skill install --agent claude-code exits 0" "0" "$?"
+expect_eq "the skill lands in ~/.claude/skills/relate" "yes" \
+  "$([ -f "${work}/home/.claude/skills/relate/SKILL.md" ] && echo yes || echo no)"
+expect_has "relate skill list reports it" "claude-code: installed" \
+  "$(HOME="${work}/home" relate skill list 2>&1)"
+
+section "Lesson 7: Add Data, Then Ask Questions"
+
+relate --database ./team.rl --mode table "MERGE (:Project {name: 'Neo4j'})" >/dev/null 2>&1
+relate --database ./team.rl --mode table "MERGE (:Project {name: 'Neo4j'})" >/dev/null 2>&1
+relate --database ./team.rl --mode table \
+  "MERGE (p:Person {name: 'Emil'}) SET p.role = 'engineer'
+   MERGE (proj:Project {name: 'Neo4j'})
+   MERGE (p)-[w:WORKS_ON]->(proj) SET w.since = 2007" >/dev/null 2>&1
+expect_eq "adding Emil exits 0" "0" "$?"
+expect_eq "there is exactly one Neo4j project" "projects
+1" "$(relate --database ./team.rl --read-only --mode csv \
+  "MATCH (proj:Project {name: 'Neo4j'})
+   RETURN count(proj) AS projects" 2>&1)"
+expect_eq "the read lists everyone, longest-standing first" "person,project,since
+Emil,Neo4j,2007
+Will,relate,2021
+Michael,opencypher-tck,2022
+Michael,relate,2023
+Oskar,relate,2024" "$(relate --database ./team.rl --read-only --mode csv \
+  "MATCH (p:Person)-[w:WORKS_ON]->(proj:Project)
+   RETURN p.name AS person, proj.name AS project, w.since AS since
+   ORDER BY since" 2>&1)"
+
+out="$(relate --database ./team.rl --read-only --mode envelope \
+  "MERGE (:Person {name: 'Test'})" 2>/dev/null)"
+code=$?
+expect_eq "a write to a read-only database exits 6" "6" "${code}"
+expect_has "the envelope error says validation_error" '{"error":{"code":"validation_error"' "${out}"
+
+printf '\n%d passed, %d failed\n' "${passed}" "${failed}"
+if [ "${failed}" -eq 0 ]; then
+  printf 'Every lesson and challenge runs in this environment.\n'
+fi
+[ "${failed}" -eq 0 ]

@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# lab-seed: rebuild team.rl so you can start a lesson without redoing the ones before it.
+#
+#   lab-seed 4           team.rl as Lesson 3 leaves it, ready for Lesson 4
+#   lab-seed 7           team.rl as Challenge 5 leaves it, ready for Lesson 7
+#   lab-seed 7 --force   replace a team.rl that already exists
+#
+# It writes one file, team.rl, in the lab folder. Nothing else changes.
+set -euo pipefail
+
+export RELATE_TELEMETRY=0
+
+LAB_DIR="${LAB_DIR:-}"
+stage=""
+force=0
+
+usage() {
+  sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+for arg in "$@"; do
+  case "${arg}" in
+    4 | 7) stage="${arg}" ;;
+    --force) force=1 ;;
+    -h | --help) usage; exit 0 ;;
+    *) echo "lab-seed: unknown argument: ${arg}" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "${stage}" ]; then
+  usage >&2
+  exit 2
+fi
+if [ -z "${LAB_DIR}" ] || [ ! -d "${LAB_DIR}" ]; then
+  echo "lab-seed: lab folder not found. Run 'lab-reset --init' first." >&2
+  exit 1
+fi
+if [ -e "${LAB_DIR}/team.rl" ] && [ "${force}" -ne 1 ]; then
+  echo "lab-seed: ${LAB_DIR}/team.rl already exists. Add --force to replace it." >&2
+  exit 1
+fi
+
+work="$(mktemp -d)"
+trap 'rm -rf "${work}"' EXIT
+mkdir -p "${work}/import"
+cd "${work}"
+
+cat > people.cypher <<'EOF'
+MERGE (o:Person {name: 'Oskar'}) SET o.role = 'engineer';
+MERGE (m:Person {name: 'Michael'}) SET m.role = 'engineer';
+MERGE (w:Person {name: 'Will'}) SET w.role = 'maintainer';
+EOF
+relate query --database ./team.rl < people.cypher
+
+if [ "${stage}" = "4" ]; then
+  cat > import/works_on.csv <<'EOF'
+person,project,since
+Oskar,relate,2024
+Michael,relate,2023
+Will,relate,2021
+EOF
+  cat > load.cypher <<'EOF'
+LOAD CSV WITH HEADERS FROM 'file:///works_on.csv' AS row
+MATCH (p:Person {name: row.person})
+MERGE (proj:Project {name: row.project})
+MERGE (p)-[w:WORKS_ON]->(proj)
+SET w.since = toInteger(row.since);
+EOF
+else
+  cat > import/contributions.csv <<'EOF'
+contributor,repo,year,language
+Oskar,relate,2024,Rust
+Michael,relate,2023,Rust
+Michael,relate,2023,Rust
+Will,relate,2021,Rust
+Michael,opencypher-tck,2022,Gherkin
+Michaell,relate,2020,Rust
+EOF
+  cat > load.cypher <<'EOF'
+LOAD CSV WITH HEADERS FROM 'file:///contributions.csv' AS row
+MATCH (p:Person {name: row.contributor})
+MERGE (proj:Project {name: row.repo})
+SET proj.language = row.language
+MERGE (p)-[w:WORKS_ON]->(proj)
+SET w.since = toInteger(row.year);
+EOF
+fi
+relate query --database ./team.rl --load-csv-dir ./import < load.cypher
+
+rm -f "${LAB_DIR}/team.rl"
+mv ./team.rl "${LAB_DIR}/team.rl"
+echo "lab-seed: wrote ${LAB_DIR}/team.rl, ready for Lesson ${stage}"

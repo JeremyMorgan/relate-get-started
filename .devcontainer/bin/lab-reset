@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# lab-reset: put the lab folder back to its starting state.
+#
+#   lab-reset           empty the lab folder (asks first)
+#   lab-reset -y        empty it without asking
+#   lab-reset --tools   also remove a relate you installed yourself and any
+#                       agent skill, so you are back on the pinned version
+#   lab-reset --init    create the folder and sample data if missing; delete nothing
+set -euo pipefail
+
+LAB_DIR="${LAB_DIR:-}"
+assume_yes=0
+reset_tools=0
+init_only=0
+
+usage() {
+  sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+for arg in "$@"; do
+  case "${arg}" in
+    -y | --yes) assume_yes=1 ;;
+    --tools) reset_tools=1 ;;
+    --init) init_only=1 ;;
+    -h | --help) usage; exit 0 ;;
+    *) echo "lab-reset: unknown option: ${arg}" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+# Refuse to run against anything that is not clearly the lab folder.
+if [ -z "${LAB_DIR}" ]; then
+  echo "lab-reset: LAB_DIR is not set. Rebuild the Codespace, or run: export LAB_DIR=/workspaces/<repo>/lab" >&2
+  exit 1
+fi
+case "${LAB_DIR}" in
+  /*/lab) ;;
+  *) echo "lab-reset: LAB_DIR must be an absolute path ending in /lab, got: ${LAB_DIR}" >&2; exit 1 ;;
+esac
+
+make_sample_data() {
+  # data/people.parquet is the input for the optional Parquet step in Lesson 3.
+  if [ -f "${LAB_DIR}/data/people.parquet" ]; then
+    return 0
+  fi
+  if ! command -v duckdb >/dev/null 2>&1; then
+    echo "lab-reset: duckdb not found, skipping the Parquet sample file" >&2
+    return 0
+  fi
+  mkdir -p "${LAB_DIR}/data"
+  (
+    cd "${LAB_DIR}"
+    duckdb -c "COPY (
+      SELECT * FROM (VALUES
+        ('Oskar', 'engineer'),
+        ('Michael', 'engineer'),
+        ('Will', 'maintainer')
+      ) AS people(name, role)
+    ) TO 'data/people.parquet' (FORMAT PARQUET)" >/dev/null
+  )
+}
+
+mkdir -p "${LAB_DIR}"
+
+if [ "${init_only}" -eq 1 ]; then
+  make_sample_data
+  echo "lab-reset: lab folder ready at ${LAB_DIR}"
+  exit 0
+fi
+
+if [ "${assume_yes}" -ne 1 ]; then
+  if [ ! -t 0 ]; then
+    echo "lab-reset: not a terminal. Run 'lab-reset -y' to confirm." >&2
+    exit 1
+  fi
+  echo "This deletes everything in ${LAB_DIR}, including team.rl and any files you made."
+  if [ "${reset_tools}" -eq 1 ]; then
+    echo "It also removes ~/.local/bin/relate and the installed Relate agent skill."
+  fi
+  printf 'Continue? [y/N] '
+  read -r answer
+  case "${answer}" in
+    y | Y | yes | YES) ;;
+    *) echo "lab-reset: nothing changed"; exit 0 ;;
+  esac
+fi
+
+# .gitkeep stays so the folder survives in git. Everything else goes.
+find "${LAB_DIR}" -mindepth 1 ! -name '.gitkeep' -delete
+make_sample_data
+
+if [ "${reset_tools}" -eq 1 ]; then
+  if command -v relate >/dev/null 2>&1; then
+    RELATE_TELEMETRY=0 relate skill remove >/dev/null 2>&1 || true
+  fi
+  rm -f "${HOME}/.local/bin/relate"
+  hash -r
+  echo "lab-reset: tools reset. relate now resolves to: $(command -v relate || echo 'not found')"
+  echo "lab-reset: run 'hash -r' or open a new terminal so your shell forgets the old path"
+fi
+
+echo "lab-reset: ${LAB_DIR} is back to its starting state"

@@ -1,0 +1,12 @@
+
+  Relate Lab is ready.
+
+  You are in the lab folder. Run the lesson commands here.
+  relate is already installed. Try it:   relate --version
+
+  lab-check          confirm the environment works
+  lab-reset          empty the lab folder and start over
+  lab-seed 4 | 7     rebuild team.rl for Lesson 4 or Lesson 7
+
+  README.md has the rest.
+

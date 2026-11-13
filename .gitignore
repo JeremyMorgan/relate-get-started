@@ -1,0 +1,9 @@
+# Student work lives in lab/ and never belongs in git.
+lab/*
+!lab/.gitkeep
+
+# Relate databases and Parquet files, wherever they end up.
+*.rl
+*.parquet
+
+.DS_Store
